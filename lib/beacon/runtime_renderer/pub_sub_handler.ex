@@ -58,6 +58,7 @@ defmodule Beacon.RuntimeRenderer.PubSubHandler do
   @impl true
   def handle_info({:layout_published, %{site: site, id: id}}, state) do
     RuntimeRenderer.Loader.reload_layout(site, id)
+    Beacon.PageRenderCache.invalidate_by_layout(site, to_string(id))
     {:noreply, schedule_css_recompilation(state, site)}
   end
 
@@ -66,13 +67,32 @@ defmodule Beacon.RuntimeRenderer.PubSubHandler do
   # ------------------------------------------------------------------
 
   def handle_info({:page_published, %{site: site, id: id}}, state) do
+    Logger.info("[PubSubHandler] Page published: #{id}")
+
+    # Capture CSS candidates BEFORE reload to detect new classes
+    old_candidates = get_page_css_candidates(site, to_string(id))
+
     RuntimeRenderer.Loader.reload_page(site, id)
-    {:noreply, schedule_css_recompilation(state, site)}
+
+    page_id = to_string(id)
+
+    # Check if CSS recompilation is needed (new Tailwind classes)
+    new_candidates = get_page_css_candidates(site, page_id)
+    needs_css_recompile = old_candidates != new_candidates
+
+    Beacon.PageRenderCache.invalidate_page(site, page_id)
+
+    if needs_css_recompile do
+      {:noreply, schedule_css_recompilation(state, site)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info({:pages_published, site, pages}, state) do
     for %{id: id} <- pages do
       RuntimeRenderer.Loader.reload_page(site, id)
+      Beacon.PageRenderCache.invalidate_page(site, to_string(id))
     end
 
     {:noreply, schedule_css_recompilation(state, site)}
@@ -102,16 +122,12 @@ defmodule Beacon.RuntimeRenderer.PubSubHandler do
 
   def handle_info({:content_updated, :component, %{site: site}}, state) do
     RuntimeRenderer.Loader.load_components(site)
+    # Component invalidation is handled directly by Content.update_component
+    # which calls PageRenderCache.invalidate_by_component with the specific name.
+    # Here we only need to reload the component IR into ETS.
     {:noreply, schedule_css_recompilation(state, site)}
   end
 
-  def handle_info({:content_updated, :live_data, %{site: site}}, state) do
-    # Live data is evaluated fresh at handle_params time, so we only need to
-    # clear the cached live_data definitions from ETS. Pages will pick up
-    # the new definitions on next request via lazy_load_live_data.
-    RuntimeRenderer.clear_live_data_cache(site)
-    {:noreply, state}
-  end
 
   def handle_info({:content_updated, :info_handler, %{site: site}}, state) do
     RuntimeRenderer.Loader.reload_info_handlers(site)
@@ -127,6 +143,11 @@ defmodule Beacon.RuntimeRenderer.PubSubHandler do
     # Invalidate the JS compile cache and recompile
     :ets.delete(:beacon_assets, {site, :js_compile})
     Beacon.RuntimeJS.load!(site)
+    {:noreply, state}
+  end
+
+  def handle_info({:content_updated, :site_setting, %{site: site}}, state) do
+    Beacon.RuntimeRenderer.clear_site_setting_cache(site)
     {:noreply, state}
   end
 
@@ -161,6 +182,15 @@ defmodule Beacon.RuntimeRenderer.PubSubHandler do
   # ------------------------------------------------------------------
   # Helpers
   # ------------------------------------------------------------------
+
+  defp get_page_css_candidates(site, page_id) do
+    table = :beacon_runtime_poc
+
+    case :ets.lookup(table, {site, page_id, :css_candidates}) do
+      [{_, candidates}] -> candidates
+      [] -> nil
+    end
+  end
 
   defp schedule_css_recompilation(%{css_timer: timer} = state, site) do
     if timer, do: Process.cancel_timer(timer)

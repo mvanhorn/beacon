@@ -36,18 +36,22 @@ defmodule Beacon.Content do
   alias Beacon.Content.ComponentSlotAttr
   alias Beacon.Content.ErrorPage
   alias Beacon.Content.EventHandler
+  alias Beacon.Content.GraphQLEndpoint
   alias Beacon.Content.InfoHandler
   alias Beacon.Content.JSHook
   alias Beacon.Content.Layout
   alias Beacon.Content.LayoutEvent
   alias Beacon.Content.LayoutSnapshot
-  alias Beacon.Content.LiveData
-  alias Beacon.Content.LiveDataAssign
   alias Beacon.Content.Page
+  alias Beacon.Content.InternalLink
   alias Beacon.Content.PageEvent
+  alias Beacon.Content.Redirect
+  alias Beacon.Content.SEOSnapshot
   alias Beacon.Content.PageField
+  alias Beacon.Content.PageQuery
   alias Beacon.Content.PageSnapshot
   alias Beacon.Content.PageVariant
+  alias Beacon.Content.SiteSetting
   alias Beacon.Content.Snippets
   alias Beacon.Content.Stylesheet
   alias Beacon.Lifecycle
@@ -65,6 +69,11 @@ defmodule Beacon.Content do
   @doc false
   def table_name(site) do
     String.to_atom("beacon_content_#{site}")
+  end
+
+  @doc false
+  def clear_page_cache(site, page_id) do
+    clear_cache(site, page_id)
   end
 
   defp clear_cache(site, key) do
@@ -468,6 +477,10 @@ defmodule Beacon.Content do
     layout
   end
 
+  defp extract_layout_snapshot(%{schema_version: 4, layout: %Layout{} = layout}) do
+    layout
+  end
+
   defp extract_layout_snapshot(_snapshot), do: nil
 
   defp convert_body_to_template(layout) do
@@ -617,6 +630,33 @@ defmodule Beacon.Content do
   end
 
   @doc """
+  Marks a page as substantively updated by setting `date_modified` to now.
+  """
+  @doc type: :pages
+  @spec mark_page_updated(Page.t()) :: {:ok, Page.t()} | {:error, Ecto.Changeset.t()}
+  def mark_page_updated(%Page{} = page) do
+    page
+    |> Ecto.Changeset.change(%{date_modified: DateTime.utc_now() |> DateTime.truncate(:microsecond)})
+    |> repo(page).update()
+  end
+
+  @doc """
+  Lists published pages that have not been substantively updated in `days` days.
+  """
+  @doc type: :pages
+  @spec list_stale_pages(Site.t(), non_neg_integer()) :: [Page.t()]
+  def list_stale_pages(site, days \\ 90) when is_atom(site) do
+    cutoff = DateTime.utc_now() |> DateTime.add(-days * 86400, :second)
+
+    from(p in Page,
+      where: p.site == ^site and (is_nil(p.date_modified) or p.date_modified < ^cutoff),
+      order_by: [asc: p.date_modified],
+      select: p
+    )
+    |> repo(site).all()
+  end
+
+  @doc """
   Publish `page`.
 
   A new snapshot is automatically created to store the page data,
@@ -736,6 +776,9 @@ defmodule Beacon.Content do
   def create_page_snapshot(page, event) do
     page = repo(page).preload(page, :variants)
 
+    # Generate the platform-agnostic AST from the template
+    ast = build_page_ast(page)
+
     attrs = %{
       "site" => page.site,
       "schema_version" => Page.version(),
@@ -746,15 +789,73 @@ defmodule Beacon.Content do
       "title" => page.title,
       "template" => page.template,
       "format" => page.format,
-      "extra" => page.extra
+      "extra" => page.extra,
+      "ast" => ast,
+      "date_modified" => page.date_modified,
+      "collection_id" => page.collection_id,
+      "fields" => page.fields || %{}
     }
 
-    fields = [:site, :schema_version, :event_id, :page, :page_id, :path, :title, :template, :format, :extra]
+    fields = [:site, :schema_version, :event_id, :page, :page_id, :path, :title, :template, :format, :extra, :ast, :date_modified, :collection_id, :fields]
 
-    %PageSnapshot{}
-    |> Changeset.cast(attrs, fields)
-    |> Changeset.validate_required(fields)
-    |> repo(page).insert()
+    result =
+      %PageSnapshot{}
+      |> Changeset.cast(attrs, fields)
+      |> Changeset.validate_required([:site, :schema_version, :event_id, :page, :page_id, :path, :title, :template, :format, :extra])
+      |> repo(page).insert()
+
+    # Also update the page's ast column
+    case result do
+      {:ok, snapshot} ->
+        if ast do
+          page
+          |> Changeset.change(%{ast: ast})
+          |> repo(page).update()
+        end
+
+        {:ok, snapshot}
+
+      error ->
+        error
+    end
+  end
+
+  @doc false
+  def build_page_ast(page) do
+    template = Beacon.Lifecycle.Template.load_template(page)
+    page_ast = Beacon.Template.Parser.parse(template)
+    component_registry = build_component_registry_for_ast(page.site)
+    nodes = Beacon.Template.ComponentExpander.expand(page_ast, component_registry)
+    # Wrap in a map for JSONB storage (Ecto :map type requires a map)
+    %{"nodes" => nodes}
+  rescue
+    error ->
+      require Logger
+      Logger.warning("[Beacon.Content] Failed to build AST for page #{page.path}: #{Exception.message(error)}")
+      nil
+  end
+
+  @doc """
+  Unwraps AST from storage format. Returns the node list from the wrapper map.
+  """
+  def unwrap_ast(%{"nodes" => nodes}) when is_list(nodes), do: nodes
+  def unwrap_ast(nodes) when is_list(nodes), do: nodes
+  def unwrap_ast(_), do: nil
+
+  @doc false
+  def build_component_registry_for_ast(site) do
+    components = list_components(site, per_page: :infinity)
+
+    Map.new(components, fn component ->
+      ast =
+        try do
+          Beacon.Template.Parser.parse(component.template || "")
+        rescue
+          _ -> []
+        end
+
+      {component.name, ast}
+    end)
   end
 
   @doc """
@@ -792,6 +893,18 @@ defmodule Beacon.Content do
     case get_page(site, id, opts) do
       %Page{} = page -> page
       nil -> raise "page #{id} not found"
+    end
+  end
+
+  @doc """
+  Gets the platform-agnostic AST for a page, or nil if not stored.
+  """
+  @doc type: :pages
+  @spec get_page_ast(Site.t(), Ecto.UUID.t()) :: [map()] | nil
+  def get_page_ast(site, page_id) do
+    case repo(site).get(Page, page_id) do
+      %Page{ast: ast} when not is_nil(ast) -> unwrap_ast(ast)
+      _ -> nil
     end
   end
 
@@ -1145,7 +1258,54 @@ defmodule Beacon.Content do
     |> maybe_add_leading_slash()
   end
 
+  defp extract_page_snapshot(%{schema_version: 3, page: %Page{} = page, ast: ast}) do
+    page = maybe_add_leading_slash(page)
+    case unwrap_ast(ast) do
+      nodes when is_list(nodes) -> %{page | ast: nodes}
+      _ -> page
+    end
+  end
+
   defp extract_page_snapshot(%{schema_version: 3, page: %Page{} = page}) do
+    page
+    |> maybe_add_leading_slash()
+  end
+
+  defp extract_page_snapshot(%{schema_version: 4, page: %Page{} = page, ast: ast}) do
+    page = maybe_add_leading_slash(page)
+    case unwrap_ast(ast) do
+      nodes when is_list(nodes) -> %{page | ast: nodes}
+      _ -> page
+    end
+  end
+
+  defp extract_page_snapshot(%{schema_version: 4, page: %Page{} = page}) do
+    page
+    |> maybe_add_leading_slash()
+  end
+
+  defp extract_page_snapshot(%{schema_version: 5, page: %Page{} = page, ast: ast}) do
+    page = maybe_add_leading_slash(page)
+    case unwrap_ast(ast) do
+      nodes when is_list(nodes) -> %{page | ast: nodes}
+      _ -> page
+    end
+  end
+
+  defp extract_page_snapshot(%{schema_version: 5, page: %Page{} = page}) do
+    page
+    |> maybe_add_leading_slash()
+  end
+
+  defp extract_page_snapshot(%{schema_version: 6, page: %Page{} = page, ast: ast}) do
+    page = maybe_add_leading_slash(page)
+    case unwrap_ast(ast) do
+      nodes when is_list(nodes) -> %{page | ast: nodes}
+      _ -> page
+    end
+  end
+
+  defp extract_page_snapshot(%{schema_version: 6, page: %Page{} = page}) do
     page
     |> maybe_add_leading_slash()
   end
@@ -1509,18 +1669,6 @@ defmodule Beacon.Content do
         example: "<h6>h6</h6>",
         category: :html_tag
       },
-      # %{
-      #   name: "live_data",
-      #   description: "Fetches and render Live Data assign",
-      #   thumbnail: "https://placehold.co/400x75?text=live_data",
-      #   attrs: [
-      #     %{name: "assign", type: "any", opts: [required: true]},
-      #     %{name: "default", type: "any", opts: [required: false, default: nil]}
-      #   ],
-      #   template: "<%= @assign || @default %>",
-      #   example: ~S|<.live_data assign={assigns[:username]} default="default" />|,
-      #   category: :data
-      # },
       %{
         name: "page_link",
         description: "Renders a link to another Beacon page",
@@ -3176,11 +3324,24 @@ defmodule Beacon.Content do
   @doc type: :components
   @spec update_component(Component.t(), map()) :: {:ok, Component.t()} | {:error, Changeset.t()}
   def update_component(%Component{} = component, attrs) do
-    component
-    |> Component.changeset(attrs)
-    |> validate_component_template()
-    |> repo(component).update()
-    |> tap(&maybe_broadcast_updated_content_event(&1, :component))
+    result =
+      component
+      |> Component.changeset(attrs)
+      |> validate_component_template()
+      |> repo(component).update()
+      |> tap(&maybe_broadcast_updated_content_event(&1, :component))
+
+    case result do
+      {:ok, updated_component} ->
+        # Cascade invalidation to all pages using this component
+        component_name = String.to_atom(updated_component.name)
+        Beacon.PageRenderCache.invalidate_by_component(updated_component.site, component_name)
+
+      _ ->
+        :ok
+    end
+
+    result
   end
 
   defp validate_component_template(changeset) do
@@ -3582,31 +3743,18 @@ defmodule Beacon.Content do
   Allowed assigns:
 
     * :page (map)
-    * :live_data (map)
+    * :data (map) — page data from GraphQL endpoints
 
   """
   @doc type: :snippets
-  @spec render_snippet(String.t(), %{
-          page: %{
-            site: Beacon.Types.Site.t(),
-            path: String.t(),
-            title: String.t(),
-            description: String.t(),
-            meta_tags: [map()],
-            raw_schema: Beacon.Types.JsonArrayMap.t(),
-            order: integer(),
-            format: atom(),
-            extra: map()
-          },
-          live_data: map()
-        }) :: {:ok, String.t()} | {:error, Beacon.SnippetError.t()}
+  @spec render_snippet(String.t(), map()) :: {:ok, String.t()} | {:error, Beacon.SnippetError.t()}
   def render_snippet(template, assigns) when is_binary(template) and is_map(assigns) do
     page = Map.get(assigns, :page) || raise "expected assigns.page missing"
-    live_data = Map.get(assigns, :live_data) || raise "expected assigns.live_data missing"
+    page_data = Map.get(assigns, :data, %{})
 
     assigns = %{
       "page" => deep_stringify(page),
-      "live_data" => deep_stringify(live_data)
+      "data" => deep_stringify(page_data)
     }
 
     with {:ok, template} <- Solid.parse(template, parser: Snippets.Parser),
@@ -3995,251 +4143,8 @@ defmodule Beacon.Content do
     end
   end
 
-  # LIVE DATA
-
-  @doc """
-  Returns a list of all existing LiveDataAssign formats.
-  """
-  @doc type: :live_data
-  @spec live_data_assign_formats() :: [atom()]
-  def live_data_assign_formats, do: LiveDataAssign.formats()
-
-  @doc """
-  Returns an `%Ecto.Changeset{}` for tracking LiveData `:path` changes.
-
-  ## Example
-
-      iex> change_live_data(live_data, %{path: "/foo/:bar_id"})
-      %Ecto.Changeset{data: %LiveData{}}
-
-  """
-  @doc type: :live_data
-  @spec change_live_data_path(LiveData.t(), map()) :: Changeset.t()
-  def change_live_data_path(%LiveData{} = live_data, attrs \\ %{}) do
-    LiveData.path_changeset(live_data, attrs)
-  end
-
-  @doc """
-  Returns an `%Ecto.Changeset{}` for tracking LiveDataAssign changes.
-
-  ## Example
-
-      iex> change_live_data_assign(live_data_assign, %{format: :elixir, value: "Enum.random(1..100)"})
-      %Ecto.Changeset{data: %LiveDataAssign{}}
-
-  """
-  @doc type: :live_data
-  @spec change_live_data_assign(LiveDataAssign.t(), map()) :: Changeset.t()
-  def change_live_data_assign(%LiveDataAssign{} = live_data_assign, attrs \\ %{}) do
-    LiveDataAssign.changeset(live_data_assign, attrs)
-  end
-
-  @doc """
-  Creates a new LiveData for scoping live data to pages.
-
-  Returns `{:ok, live_data}` if successful, otherwise `{:error, changeset}`
-  """
-  @doc type: :live_data
-  @spec create_live_data(map()) :: {:ok, LiveData.t()} | {:error, Changeset.t()}
-  def create_live_data(attrs) do
-    changeset = LiveData.changeset(%LiveData{}, attrs)
-    site = Changeset.get_field(changeset, :site)
-
-    changeset
-    |> repo(site).insert()
-    |> tap(&maybe_broadcast_updated_content_event(&1, :live_data))
-  end
-
-  @doc """
-  Creates a new LiveData for scoping live data to pages, raising an error if unsuccessful.
-
-  Returns the new LiveData if successful, otherwise raises a `RuntimeError`.
-  """
-  @doc type: :live_data
-  @spec create_live_data!(map()) :: LiveData.t()
-  def create_live_data!(attrs) do
-    case create_live_data(attrs) do
-      {:ok, live_data} -> live_data
-      {:error, changeset} -> raise "failed to create live data, got: #{inspect(changeset.errors)}"
-    end
-  end
-
-  @doc """
-  Creates a new LiveDataAssign.
-  """
-  @doc type: :live_data
-  @spec create_assign_for_live_data(LiveData.t(), map()) :: {:ok, LiveData.t()} | {:error, Changeset.t()}
-  def create_assign_for_live_data(live_data, attrs) do
-    changeset =
-      live_data
-      |> Ecto.build_assoc(:assigns)
-      |> Map.put(:live_data, live_data)
-      |> LiveDataAssign.changeset(attrs)
-      |> validate_live_data_code()
-
-    case repo(live_data).insert(changeset) do
-      {:ok, %LiveDataAssign{}} ->
-        live_data = repo(live_data).preload(live_data, :assigns, force: true)
-        maybe_broadcast_updated_content_event({:ok, live_data}, :live_data)
-        {:ok, live_data}
-
-      {:error, changeset} ->
-        {:error, changeset}
-    end
-  end
-
-  @doc """
-  Gets a single live data by `clauses`.
-
-  ## Example
-
-      iex> get_live_data_by(site, id: "cba9ee2e-d40e-48af-9704-1237e4c23bde")
-      %LiveData{}
-
-      iex> get_live_data_by(site, path: "/blog")
-      %LiveData{}
-
-  """
-  @doc type: :live_data
-  @spec get_live_data_by(Site.t(), keyword(), keyword()) :: LiveData.t() | nil
-  def get_live_data_by(site, clauses, opts \\ []) when is_atom(site) and is_list(clauses) do
-    clauses = Keyword.put(clauses, :site, site)
-    repo(site).get_by(LiveData, clauses, opts) |> repo(site).preload(:assigns)
-  end
-
-  @doc """
-  Query LiveData for a given site.
-
-  ## Options
-
-    * `:per_page` - limit how many records are returned, or pass `:infinity` to return all records.
-    * `:query` - search records by path.
-    * `:select` - returns only the given field(s)
-    * `:preload` - include given association(s) (defaults to `:assigns`)
-
-  """
-  @doc type: :live_data
-  @spec live_data_for_site(Site.t(), Keyword.t()) :: [String.t()]
-  def live_data_for_site(site, opts \\ []) do
-    per_page = Keyword.get(opts, :per_page, :infinity)
-    search = Keyword.get(opts, :query)
-    select = Keyword.get(opts, :select)
-    preload = Keyword.get(opts, :preload, :assigns)
-
-    site
-    |> query_live_data_for_site_base()
-    |> query_live_data_for_site_limit(per_page)
-    |> query_live_data_for_site_search(search)
-    |> query_live_data_for_site_select(select)
-    |> query_live_data_for_site_preload(preload)
-    |> repo(site).all()
-  end
-
-  defp query_live_data_for_site_base(site) do
-    from ld in LiveData,
-      where: ld.site == ^site,
-      order_by: [asc: ld.path]
-  end
-
-  defp query_live_data_for_site_limit(query, limit) when is_integer(limit), do: from(q in query, limit: ^limit)
-  defp query_live_data_for_site_limit(query, :infinity = _limit), do: query
-  defp query_live_data_for_site_limit(query, _per_page), do: from(q in query, limit: 20)
-
-  defp query_live_data_for_site_search(query, search) when is_binary(search), do: from(q in query, where: ilike(q.path, ^"%#{search}%"))
-  defp query_live_data_for_site_search(query, _search), do: query
-
-  defp query_live_data_for_site_select(query, nil = _select), do: query
-  defp query_live_data_for_site_select(query, select), do: from(q in query, select: ^select)
-
-  defp query_live_data_for_site_preload(query, nil), do: query
-  defp query_live_data_for_site_preload(query, preload) when is_atom(preload) or is_list(preload), do: from(q in query, preload: ^preload)
-
-  @doc """
-  Updates LiveDataPath.
-
-      iex> update_live_data_path(live_data, "/foo/bar/:baz_id")
-      {:ok, %LiveData{}}
-
-  """
-  @doc type: :live_data
-  @spec update_live_data_path(LiveData.t(), String.t()) :: {:ok, LiveData.t()} | {:error, Changeset.t()}
-  def update_live_data_path(%LiveData{} = live_data, path) do
-    live_data
-    |> LiveData.path_changeset(%{path: path})
-    |> repo(live_data).update()
-    |> tap(&maybe_broadcast_updated_content_event(&1, :live_data))
-  end
-
-  @doc """
-  Updates LiveDataAssign.
-
-      iex> update_live_data_assign(live_data_assign, :my_site, %{code: "true"})
-      {:ok, %LiveDataAssign{}}
-
-  """
-  @doc type: :live_data
-  @spec update_live_data_assign(LiveDataAssign.t(), Site.t(), map()) :: {:ok, LiveDataAssign.t()} | {:error, Changeset.t()}
-  def update_live_data_assign(%LiveDataAssign{} = live_data_assign, site, attrs) do
-    live_data_assign
-    |> repo(site).preload(:live_data)
-    |> LiveDataAssign.changeset(attrs)
-    |> validate_live_data_code()
-    |> repo(site).update()
-    |> tap(fn
-      {:ok, live_data_assign} -> maybe_broadcast_updated_content_event({:ok, live_data_assign.live_data}, :live_data)
-      _error -> :skip
-    end)
-  end
-
-  defp validate_live_data_code(changeset) do
-    site = Changeset.get_field(changeset, :site)
-    value = Changeset.get_field(changeset, :value)
-    format = Changeset.get_field(changeset, :format)
-    metadata = %Beacon.Template.LoadMetadata{site: site, path: "nopath"}
-
-    variable_names =
-      changeset
-      |> Changeset.get_field(:live_data)
-      |> Map.fetch!(:path)
-      |> vars_from_path()
-      |> List.insert_at(0, "params")
-
-    do_validate_template(changeset, :value, format, value, metadata, variable_names)
-  end
-
-  defp vars_from_path(path) do
-    path
-    |> String.split("/")
-    |> Enum.filter(&String.starts_with?(&1, ":"))
-    |> Enum.map(&String.slice(&1, 1..-1//1))
-  end
-
-  @doc """
-  Deletes LiveData.
-  """
-  @doc type: :live_data
-  @spec delete_live_data(LiveData.t()) :: {:ok, LiveData.t()} | {:error, Changeset.t()}
-  def delete_live_data(live_data) do
-    repo(live_data).delete(live_data)
-  end
-
-  @doc """
-  Deletes LiveDataAssign.
-  """
-  @doc type: :live_data
-  @spec delete_live_data_assign(LiveDataAssign.t(), Site.t()) :: {:ok, LiveDataAssign.t()} | {:error, Changeset.t()}
-  def delete_live_data_assign(live_data_assign, site) do
-    repo(site).delete(live_data_assign)
-  end
-
   @doc """
   Creates a new info handler for creating shared handle_info callbacks.
-
-  ## Example
-
-      iex> create_info_handler(%{site: "my_site", msg: "{:new_msg, arg}", code: "{:noreply, socket}"})
-      {:ok, %InfoHandler{}}
-
   """
   @doc type: :info_handlers
   @spec create_info_handler(map()) :: {:ok, InfoHandler.t()} | {:error, Changeset.t()}
@@ -4381,16 +4286,7 @@ defmodule Beacon.Content do
     Changeset.add_error(changeset, field, "can't be blank", compilation_error: nil)
   end
 
-  defp do_validate_template(changeset, field, :heex = _format, template, metadata, _, _) when is_binary(template) do
-    Changeset.validate_change(changeset, field, fn ^field, template ->
-      case Beacon.Template.HEEx.compile(metadata.site, metadata.path, template) do
-        {:ok, _ast} -> []
-        {:error, %{description: description}} -> [{field, {"invalid", compilation_error: description}}]
-        {:error, %_{} = exception} -> [{field, {"invalid", compilation_error: Exception.message(exception)}}]
-        {:error, _} -> [{field, "invalid"}]
-      end
-    end)
-  end
+  defp do_validate_template(changeset, _field, :heex = _format, _template, _metadata, _, _), do: changeset
 
   defp do_validate_template(changeset, field, :markdown = _format, template, metadata, _, _) when is_binary(template) do
     Changeset.validate_change(changeset, field, fn ^field, template ->
@@ -4411,6 +4307,18 @@ defmodule Beacon.Content do
   end
 
   defp do_validate_template(changeset, _field, :text = _format, _template, _metadata, _, _), do: changeset
+
+  defp do_validate_template(changeset, field, :beacon = _format, template, _metadata, _, _) when is_binary(template) do
+    Changeset.validate_change(changeset, field, fn ^field, template ->
+      try do
+        Beacon.Template.Parser.parse(template)
+        []
+      rescue
+        e in Beacon.Template.ParseError ->
+          [{field, {"invalid", compilation_error: Exception.message(e)}}]
+      end
+    end)
+  end
 
   # TODO: expose template validation to custom template formats defined by users
   defp do_validate_template(changeset, _field, _format, _template, _metadata, _, _), do: changeset
@@ -4477,6 +4385,7 @@ defmodule Beacon.Content do
     case insert_published_page(page) do
       {:ok, page} ->
         :ok = Beacon.PubSub.page_published(page)
+        maybe_rebuild_links_async(page)
         {:reply, {:ok, page}, config}
 
       error ->
@@ -4580,6 +4489,9 @@ defmodule Beacon.Content do
     %{site: site} = page
     changeset = Page.update_changeset(page, %{})
 
+    # Auto-create redirect if page path changed since last publish
+    maybe_create_path_redirect(page)
+
     transact(repo(site), fn ->
       with {:ok, _changeset} <- validate_page_template(changeset),
            {:ok, event} <- create_page_event(page, "published"),
@@ -4606,8 +4518,13 @@ defmodule Beacon.Content do
 
     Beacon.RuntimeRenderer.publish_layout(site, to_string(id), layout.template,
       meta_tags: layout.meta_tags || [],
-      resource_links: layout.resource_links || []
+      resource_links: layout.resource_links || [],
+      default_og_image: layout.default_og_image,
+      default_twitter_card: layout.default_twitter_card
     )
+
+    # Cascade invalidation to all pages using this layout
+    Beacon.PageRenderCache.invalidate_by_layout(site, to_string(id))
 
     :ok
   end
@@ -4621,6 +4538,8 @@ defmodule Beacon.Content do
       page ->
         :ok = Beacon.RouterServer.add_page(page.site, page.id, page.path)
         Beacon.RuntimeRenderer.Loader.load_page(site, page)
+        # Cascade invalidation to notify connected LiveViews
+        Beacon.PageRenderCache.invalidate_page(site, to_string(page.id))
     end
 
     :ok
@@ -4649,10 +4568,707 @@ defmodule Beacon.Content do
     end
   end
 
+  # SITE SETTINGS
+
+  @doc """
+  Returns an `%Ecto.Changeset{}` for tracking site setting changes.
+
+  ## Example
+
+      iex> change_site_setting(setting, %{value: "new value"})
+      %Ecto.Changeset{data: %SiteSetting{}}
+
+  """
+  @doc type: :site_settings
+  @spec change_site_setting(SiteSetting.t(), map()) :: Changeset.t()
+  def change_site_setting(%SiteSetting{} = setting, attrs \\ %{}) do
+    SiteSetting.changeset(setting, attrs)
+  end
+
+  @doc """
+  Creates a site setting.
+
+  ## Example
+
+      iex> create_site_setting(%{site: :my_site, key: "notification_template", value: "<div>Updated</div>"})
+      {:ok, %SiteSetting{}}
+
+  """
+  @doc type: :site_settings
+  @spec create_site_setting(map()) :: {:ok, SiteSetting.t()} | {:error, Changeset.t()}
+  def create_site_setting(attrs) do
+    changeset = SiteSetting.changeset(%SiteSetting{}, attrs)
+    site = Changeset.get_field(changeset, :site)
+
+    repo(site).insert(changeset)
+  end
+
+  @doc """
+  Creates a site setting, raising an error if unsuccessful.
+  """
+  @doc type: :site_settings
+  @spec create_site_setting!(map()) :: SiteSetting.t()
+  def create_site_setting!(attrs) do
+    case create_site_setting(attrs) do
+      {:ok, setting} -> setting
+      {:error, changeset} -> raise "failed to create site setting, got: #{inspect(changeset.errors)}"
+    end
+  end
+
+  @doc """
+  Updates a site setting.
+
+  ## Example
+
+      iex> update_site_setting(setting, %{value: "new value"})
+      {:ok, %SiteSetting{}}
+
+  """
+  @doc type: :site_settings
+  @spec update_site_setting(SiteSetting.t(), map()) :: {:ok, SiteSetting.t()} | {:error, Changeset.t()}
+  def update_site_setting(%SiteSetting{} = setting, attrs) do
+    changeset = SiteSetting.changeset(setting, attrs)
+    site = Changeset.get_field(changeset, :site)
+
+    changeset
+    |> repo(site).update()
+    |> tap(&maybe_broadcast_updated_content_event(&1, :site_setting))
+  end
+
+  @doc """
+  Gets a single site setting by `key` for the given `site`.
+
+  ## Example
+
+      iex> get_site_setting(:my_site, "notification_template")
+      %SiteSetting{}
+
+  """
+  @doc type: :site_settings
+  @spec get_site_setting(Site.t(), String.t()) :: SiteSetting.t() | nil
+  def get_site_setting(site, key) when is_atom(site) and is_binary(key) do
+    repo(site).one(
+      from s in SiteSetting,
+        where: s.site == ^site and s.key == ^key
+    )
+  end
+
+  @doc """
+  Gets the value for a site setting by `key`, falling back to the known default if the setting does not exist.
+
+  Returns `nil` if the key is not found and has no known default.
+
+  ## Example
+
+      iex> get_site_setting_value(:my_site, "notification_template")
+      "<div>...</div>"
+
+  """
+  @doc type: :site_settings
+  @spec get_site_setting_value(Site.t(), String.t()) :: String.t() | nil
+  def get_site_setting_value(site, key) when is_atom(site) and is_binary(key) do
+    case get_site_setting(site, key) do
+      %SiteSetting{value: value} ->
+        value
+
+      nil ->
+        case SiteSetting.known_keys() do
+          %{^key => %{default: default}} -> default
+          _ -> nil
+        end
+    end
+  end
+
+  @doc """
+  Lists all site settings for the given `site`.
+
+  ## Example
+
+      iex> list_site_settings(:my_site)
+      [%SiteSetting{}, ...]
+
+  """
+  @doc type: :site_settings
+  @spec list_site_settings(Site.t()) :: [SiteSetting.t()]
+  def list_site_settings(site) when is_atom(site) do
+    repo(site).all(
+      from s in SiteSetting,
+        where: s.site == ^site,
+        order_by: [asc: s.key]
+    )
+  end
+
+  @doc """
+  Deletes a site setting.
+
+  ## Example
+
+      iex> delete_site_setting(setting)
+      {:ok, %SiteSetting{}}
+
+  """
+  @doc type: :site_settings
+  @spec delete_site_setting(SiteSetting.t()) :: {:ok, SiteSetting.t()} | {:error, Changeset.t()}
+  def delete_site_setting(%SiteSetting{} = setting) do
+    repo(setting.site).delete(setting)
+  end
+
+  # GraphQL Endpoints
+
+  @doc """
+  Returns all GraphQL endpoints for the given site.
+  """
+  @doc type: :graphql_endpoints
+  @spec list_graphql_endpoints(Site.t()) :: [GraphQLEndpoint.t()]
+  def list_graphql_endpoints(site) do
+    repo(site).all(
+      from e in GraphQLEndpoint,
+        where: e.site == ^site,
+        order_by: [asc: e.name]
+    )
+  end
+
+  @doc """
+  Gets a single GraphQL endpoint by id.
+  """
+  @doc type: :graphql_endpoints
+  @spec get_graphql_endpoint(Site.t(), Ecto.UUID.t()) :: GraphQLEndpoint.t() | nil
+  def get_graphql_endpoint(site, id) do
+    repo(site).get(GraphQLEndpoint, id)
+  end
+
+  @doc """
+  Gets a single GraphQL endpoint matching the given clauses.
+  """
+  @doc type: :graphql_endpoints
+  @spec get_graphql_endpoint_by(Site.t(), keyword() | map()) :: GraphQLEndpoint.t() | nil
+  def get_graphql_endpoint_by(site, clauses) do
+    clauses = Keyword.put_new(clauses, :site, site)
+    repo(site).get_by(GraphQLEndpoint, clauses)
+  end
+
+  @doc """
+  Creates a new GraphQL endpoint.
+  """
+  @doc type: :graphql_endpoints
+  @spec create_graphql_endpoint(map()) :: {:ok, GraphQLEndpoint.t()} | {:error, Changeset.t()}
+  def create_graphql_endpoint(attrs) do
+    %GraphQLEndpoint{}
+    |> GraphQLEndpoint.changeset(attrs)
+    |> repo(attrs.site || attrs["site"]).insert()
+  end
+
+  @doc """
+  Updates an existing GraphQL endpoint.
+  """
+  @doc type: :graphql_endpoints
+  @spec update_graphql_endpoint(GraphQLEndpoint.t(), map()) :: {:ok, GraphQLEndpoint.t()} | {:error, Changeset.t()}
+  def update_graphql_endpoint(%GraphQLEndpoint{} = endpoint, attrs) do
+    endpoint
+    |> GraphQLEndpoint.changeset(attrs)
+    |> repo(endpoint.site).update()
+  end
+
+  @doc """
+  Deletes a GraphQL endpoint.
+  """
+  @doc type: :graphql_endpoints
+  @spec delete_graphql_endpoint(GraphQLEndpoint.t()) :: {:ok, GraphQLEndpoint.t()} | {:error, Changeset.t()}
+  def delete_graphql_endpoint(%GraphQLEndpoint{} = endpoint) do
+    repo(endpoint.site).delete(endpoint)
+  end
+
+  @doc """
+  Returns an `%Ecto.Changeset{}` for tracking GraphQL endpoint changes.
+  """
+  @doc type: :graphql_endpoints
+  @spec change_graphql_endpoint(GraphQLEndpoint.t(), map()) :: Changeset.t()
+  def change_graphql_endpoint(%GraphQLEndpoint{} = endpoint, attrs \\ %{}) do
+    GraphQLEndpoint.changeset(endpoint, attrs)
+  end
+
+  # Page Queries
+
+  @doc """
+  Returns all page queries for the given page.
+  """
+  @doc type: :page_queries
+  @spec list_page_queries(Site.t(), Ecto.UUID.t()) :: [PageQuery.t()]
+  def list_page_queries(site, page_id) do
+    repo(site).all(
+      from pq in PageQuery,
+        where: pq.page_id == ^page_id,
+        order_by: [asc: pq.sort_order, asc: pq.inserted_at]
+    )
+  end
+
+  @doc """
+  Creates a new page query.
+  """
+  @doc type: :page_queries
+  @spec create_page_query(Site.t(), map()) :: {:ok, PageQuery.t()} | {:error, Changeset.t()}
+  def create_page_query(site, attrs) do
+    %PageQuery{}
+    |> PageQuery.changeset(attrs)
+    |> repo(site).insert()
+  end
+
+  @doc """
+  Updates an existing page query.
+  """
+  @doc type: :page_queries
+  @spec update_page_query(Site.t(), PageQuery.t(), map()) :: {:ok, PageQuery.t()} | {:error, Changeset.t()}
+  def update_page_query(site, %PageQuery{} = page_query, attrs) do
+    page_query
+    |> PageQuery.changeset(attrs)
+    |> repo(site).update()
+  end
+
+  @doc """
+  Deletes a page query.
+  """
+  @doc type: :page_queries
+  @spec delete_page_query(Site.t(), PageQuery.t()) :: {:ok, PageQuery.t()} | {:error, Changeset.t()}
+  def delete_page_query(site, %PageQuery{} = page_query) do
+    repo(site).delete(page_query)
+  end
+
+  @doc """
+  Returns an `%Ecto.Changeset{}` for tracking page query changes.
+  """
+  @doc type: :page_queries
+  @spec change_page_query(PageQuery.t(), map()) :: Changeset.t()
+  def change_page_query(%PageQuery{} = page_query, attrs \\ %{}) do
+    PageQuery.changeset(page_query, attrs)
+  end
+
   @doc false
   def handle_info(msg, config) do
     Logger.warning("Beacon.Content can not handle the message: #{inspect(msg)}")
     {:noreply, config}
+  end
+
+  defp maybe_rebuild_links_async(page) do
+    Task.start(fn ->
+      try do
+        template = Beacon.Lifecycle.Template.load_template(page)
+        ast = Beacon.Template.Parser.parse(template)
+        component_registry = build_component_registry_for_ast(page.site)
+        expanded = Beacon.Template.ComponentExpander.expand(ast, component_registry)
+        html = Beacon.Client.LiveViewCompiler.render_to_string(expanded, %{})
+        rebuild_links_for_page(page.site, page.id, html)
+      rescue
+        _error -> :ok
+      catch
+        _kind, _reason -> :ok
+      end
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Template Types
+  # ---------------------------------------------------------------------------
+
+  alias Beacon.Content.Collection
+
+  @doc "Creates a collection."
+  @doc type: :collections
+  @spec create_collection(map()) :: {:ok, Collection.t()} | {:error, Ecto.Changeset.t()}
+  def create_collection(attrs) when is_map(attrs) do
+    site = attrs[:site] || attrs["site"]
+    %Collection{} |> Collection.changeset(attrs) |> repo(site).insert()
+  end
+
+  @doc "Updates a collection."
+  @doc type: :collections
+  @spec update_collection(Collection.t(), map()) :: {:ok, Collection.t()} | {:error, Ecto.Changeset.t()}
+  def update_collection(%Collection{} = col, attrs) do
+    col |> Collection.changeset(attrs) |> repo(col).update()
+  end
+
+  @doc "Deletes a collection."
+  @doc type: :collections
+  @spec delete_collection(Collection.t()) :: {:ok, Collection.t()} | {:error, Ecto.Changeset.t()}
+  def delete_collection(%Collection{} = col) do
+    repo(col).delete(col)
+  end
+
+  @doc "Lists collections available to a site (includes global collections where site is nil)."
+  @doc type: :collections
+  @spec list_collections(Site.t(), keyword()) :: [Collection.t()]
+  def list_collections(site, opts \\ []) when is_atom(site) do
+    query =
+      cond do
+        opts[:globals_only] ->
+          from(c in Collection, where: is_nil(c.site))
+
+        opts[:mode] ->
+          mode = to_string(opts[:mode])
+          from(c in Collection, where: (c.site == ^site or is_nil(c.site)) and c.mode == ^mode)
+
+        true ->
+          from(c in Collection, where: c.site == ^site or is_nil(c.site))
+      end
+
+    query
+    |> order_by([c], [asc: c.sort_order, asc: c.name])
+    |> repo(site).all()
+  end
+
+  @doc "Gets a collection by ID."
+  @doc type: :collections
+  @spec get_collection(Site.t(), String.t()) :: Collection.t() | nil
+  def get_collection(site, id) when is_atom(site) do
+    repo(site).get(Collection, id)
+  end
+
+  @doc "Gets a collection by ID, raises if not found."
+  @doc type: :collections
+  @spec get_collection!(Site.t(), String.t()) :: Collection.t()
+  def get_collection!(site, id) when is_atom(site) do
+    repo(site).get!(Collection, id)
+  end
+
+  @doc "Gets a collection by slug (checks site-specific first, then global)."
+  @doc type: :collections
+  @spec get_collection_by_slug(Site.t(), String.t()) :: Collection.t() | nil
+  def get_collection_by_slug(site, slug) when is_atom(site) do
+    case repo(site).get_by(Collection, site: site, slug: slug) do
+      nil -> repo(site).get_by(Collection, site: nil, slug: slug)
+      col -> col
+    end
+  end
+
+  @doc "Returns a changeset for tracking collection changes."
+  @doc type: :collections
+  def change_collection(%Collection{} = col, attrs \\ %{}) do
+    Collection.changeset(col, attrs)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Internal Link Graph
+  # ---------------------------------------------------------------------------
+
+  @doc "Rebuilds the internal link graph for a page from rendered HTML."
+  @doc type: :links
+  @spec rebuild_links_for_page(Site.t(), String.t(), String.t()) :: :ok
+  def rebuild_links_for_page(site, page_id, html) when is_atom(site) do
+    links = Beacon.SEO.LinkExtractor.extract(html)
+
+    # Delete existing links for this page
+    from(l in InternalLink, where: l.site == ^site and l.source_page_id == ^page_id)
+    |> repo(site).delete_all()
+
+    # Build a path→page_id lookup for resolving target_page_id
+    published_pages = list_published_pages(site, per_page: :infinity)
+    path_to_id = Map.new(published_pages, fn p -> {p.path, p.id} end)
+
+    # Insert new links
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    entries =
+      Enum.map(links, fn link ->
+        %{
+          id: Ecto.UUID.generate(),
+          site: Atom.to_string(site),
+          source_page_id: page_id,
+          target_page_id: Map.get(path_to_id, link.target_path),
+          target_path: link.target_path,
+          anchor_text: String.slice(link.anchor_text || "", 0..254),
+          inserted_at: now
+        }
+      end)
+
+    if entries != [] do
+      repo(site).insert_all("beacon_internal_links", entries, on_conflict: :nothing)
+    end
+
+    :ok
+  end
+
+  @doc "Lists published pages with zero inbound internal links (orphans)."
+  @doc type: :links
+  @spec list_orphan_pages(Site.t()) :: [Page.t()]
+  def list_orphan_pages(site) when is_atom(site) do
+    # Get all page IDs that are targets of at least one internal link
+    linked_ids =
+      from(l in InternalLink,
+        where: l.site == ^site and not is_nil(l.target_page_id),
+        select: l.target_page_id,
+        distinct: true
+      )
+
+    from(p in Page,
+      where: p.site == ^site and p.id not in subquery(linked_ids),
+      order_by: [asc: p.path]
+    )
+    |> repo(site).all()
+  end
+
+  @doc "Lists internal links where the target path doesn't match any published page."
+  @doc type: :links
+  @spec list_broken_links(Site.t()) :: [InternalLink.t()]
+  def list_broken_links(site) when is_atom(site) do
+    from(l in InternalLink,
+      where: l.site == ^site and is_nil(l.target_page_id),
+      order_by: [asc: l.target_path]
+    )
+    |> repo(site).all()
+  end
+
+  @doc "Returns per-page inbound and outbound link counts."
+  @doc type: :links
+  @spec list_link_stats(Site.t()) :: [%{page_id: String.t(), path: String.t(), inbound: integer(), outbound: integer()}]
+  def list_link_stats(site) when is_atom(site) do
+    inbound_q =
+      from(l in InternalLink,
+        where: l.site == ^site and not is_nil(l.target_page_id),
+        group_by: l.target_page_id,
+        select: %{page_id: l.target_page_id, count: count(l.id)}
+      )
+
+    outbound_q =
+      from(l in InternalLink,
+        where: l.site == ^site,
+        group_by: l.source_page_id,
+        select: %{page_id: l.source_page_id, count: count(l.id)}
+      )
+
+    inbound_map = repo(site).all(inbound_q) |> Map.new(&{&1.page_id, &1.count})
+    outbound_map = repo(site).all(outbound_q) |> Map.new(&{&1.page_id, &1.count})
+
+    list_published_pages(site, per_page: :infinity)
+    |> Enum.map(fn page ->
+      %{
+        page_id: page.id,
+        path: page.path,
+        title: page.title,
+        inbound: Map.get(inbound_map, page.id, 0),
+        outbound: Map.get(outbound_map, page.id, 0)
+      }
+    end)
+    |> Enum.sort_by(& &1.inbound)
+  end
+
+  # ---------------------------------------------------------------------------
+  # SEO Measurement
+  # ---------------------------------------------------------------------------
+
+  @doc "Takes a snapshot of current SEO metrics for a site."
+  @doc type: :seo
+  @spec take_seo_snapshot(Site.t()) :: {:ok, SEOSnapshot.t()} | {:error, Ecto.Changeset.t()}
+  def take_seo_snapshot(site) when is_atom(site) do
+    metrics = Beacon.SEO.Metrics.compute(site)
+    today = Date.utc_today()
+
+    attrs = %{
+      "site" => site,
+      "snapshot_date" => today,
+      "metrics" => metrics
+    }
+
+    # Upsert: update if exists for today, insert if not
+    case repo(site).get_by(SEOSnapshot, site: site, snapshot_date: today) do
+      nil ->
+        %SEOSnapshot{} |> SEOSnapshot.changeset(attrs) |> repo(site).insert()
+
+      existing ->
+        existing |> SEOSnapshot.changeset(attrs) |> repo(site).update()
+    end
+  end
+
+  @doc "Lists SEO snapshots for a site within a date range."
+  @doc type: :seo
+  @spec list_seo_snapshots(Site.t(), keyword()) :: [SEOSnapshot.t()]
+  def list_seo_snapshots(site, opts \\ []) when is_atom(site) do
+    days = Keyword.get(opts, :days, 30)
+    since = Date.utc_today() |> Date.add(-days)
+
+    from(s in SEOSnapshot,
+      where: s.site == ^site and s.snapshot_date >= ^since,
+      order_by: [desc: s.snapshot_date]
+    )
+    |> repo(site).all()
+  end
+
+  # ---------------------------------------------------------------------------
+  # Redirects
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Creates a redirect, automatically flattening chains and rejecting circulars.
+  """
+  @doc type: :redirects
+  @spec create_redirect(map()) :: {:ok, Redirect.t()} | {:error, Ecto.Changeset.t()}
+  def create_redirect(attrs) when is_map(attrs) do
+    attrs = Map.new(attrs, fn
+      {key, val} when is_binary(key) -> {key, val}
+      {key, val} -> {Atom.to_string(key), val}
+    end)
+    {:ok, site} = Beacon.Types.Site.cast(attrs["site"])
+
+    # Flatten chains: if destination is another redirect's source, point to final destination
+    attrs = flatten_redirect_chain(site, attrs)
+
+    changeset = Redirect.changeset(%Redirect{}, attrs)
+
+    # Check for circular redirect through the chain
+    if circular_redirect?(site, attrs["source_path"], attrs["destination_path"]) do
+      {:error, Ecto.Changeset.add_error(changeset, :destination_path, "creates a circular redirect")}
+    else
+      case repo(site).insert(changeset) do
+        {:ok, redirect} ->
+          # Update any existing redirects that point to this source (flatten them)
+          update_existing_redirect_chains(site, redirect)
+          Beacon.Content.RedirectCache.put(redirect)
+          {:ok, redirect}
+
+        error ->
+          error
+      end
+    end
+  end
+
+  @doc "Updates an existing redirect."
+  @doc type: :redirects
+  @spec update_redirect(Redirect.t(), map()) :: {:ok, Redirect.t()} | {:error, Ecto.Changeset.t()}
+  def update_redirect(%Redirect{} = redirect, attrs) do
+    case redirect |> Redirect.changeset(attrs) |> repo(redirect).update() do
+      {:ok, updated} ->
+        Beacon.Content.RedirectCache.invalidate(updated.site)
+        {:ok, updated}
+
+      error ->
+        error
+    end
+  end
+
+  @doc "Deletes a redirect."
+  @doc type: :redirects
+  @spec delete_redirect(Redirect.t()) :: {:ok, Redirect.t()} | {:error, Ecto.Changeset.t()}
+  def delete_redirect(%Redirect{} = redirect) do
+    case repo(redirect).delete(redirect) do
+      {:ok, deleted} ->
+        Beacon.Content.RedirectCache.delete(deleted.site, deleted.source_path)
+        {:ok, deleted}
+
+      error ->
+        error
+    end
+  end
+
+  @doc "Lists all redirects for a site."
+  @doc type: :redirects
+  @spec list_redirects(Site.t(), keyword()) :: [Redirect.t()]
+  def list_redirects(site, opts \\ []) when is_atom(site) do
+    per_page = Keyword.get(opts, :per_page, 20)
+    page = Keyword.get(opts, :page, 1)
+    search = Keyword.get(opts, :search)
+
+    query = from(r in Redirect, where: r.site == ^site, order_by: [desc: r.inserted_at])
+
+    query = if per_page == :infinity, do: query, else: query |> limit(^per_page) |> offset(^((page - 1) * per_page))
+    query = if search, do: where(query, [r], ilike(r.source_path, ^"%#{search}%") or ilike(r.destination_path, ^"%#{search}%")), else: query
+
+    repo(site).all(query)
+  end
+
+  @doc "Gets a single redirect by ID."
+  @doc type: :redirects
+  @spec get_redirect(Site.t(), String.t()) :: Redirect.t() | nil
+  def get_redirect(site, id) when is_atom(site) do
+    repo(site).get_by(Redirect, site: site, id: id)
+  end
+
+  @doc "Gets a redirect by source path."
+  @doc type: :redirects
+  @spec get_redirect_by_source(Site.t(), String.t()) :: Redirect.t() | nil
+  def get_redirect_by_source(site, source_path) when is_atom(site) do
+    repo(site).get_by(Redirect, site: site, source_path: source_path)
+  end
+
+  @doc false
+  def increment_redirect_hit(site, source_path) do
+    from(r in Redirect,
+      where: r.site == ^site and r.source_path == ^source_path
+    )
+    |> repo(site).update_all(set: [hit_count: dynamic([r], r.hit_count + 1), last_hit_at: DateTime.utc_now()])
+  end
+
+  @doc false
+  def change_redirect(%Redirect{} = redirect, attrs \\ %{}) do
+    Redirect.changeset(redirect, attrs)
+  end
+
+  # Auto-create redirect when a page's path changes at publish time
+  @doc false
+  def maybe_create_path_redirect(page) do
+    old_path = get_last_published_path(page.site, page.id)
+
+    case old_path do
+      nil -> :ok
+      ^old_path when old_path == page.path -> :ok
+      old_path ->
+        create_redirect(%{
+          "site" => page.site,
+          "source_path" => old_path,
+          "destination_path" => page.path,
+          "status_code" => 301
+        })
+    end
+  end
+
+  defp get_last_published_path(site, page_id) do
+    from(s in PageSnapshot,
+      where: s.site == ^site and s.page_id == ^page_id,
+      order_by: [desc: s.inserted_at],
+      limit: 1,
+      select: s.path
+    )
+    |> repo(site).one()
+  end
+
+  defp flatten_redirect_chain(site, attrs) do
+    dest = attrs["destination_path"]
+
+    case get_redirect_by_source(site, dest) do
+      %Redirect{destination_path: final_dest} ->
+        Map.put(attrs, "destination_path", final_dest)
+
+      nil ->
+        attrs
+    end
+  end
+
+  defp circular_redirect?(site, source, destination) do
+    visited = MapSet.new([source])
+    check_circular(site, destination, visited)
+  end
+
+  defp check_circular(_site, nil, _visited), do: false
+
+  defp check_circular(site, path, visited) do
+    if MapSet.member?(visited, path) do
+      true
+    else
+      case get_redirect_by_source(site, path) do
+        %Redirect{destination_path: next} ->
+          check_circular(site, next, MapSet.put(visited, path))
+
+        nil ->
+          false
+      end
+    end
+  end
+
+  defp update_existing_redirect_chains(site, new_redirect) do
+    # Find redirects whose destination is the new redirect's source and update them
+    from(r in Redirect,
+      where: r.site == ^site and r.destination_path == ^new_redirect.source_path and r.id != ^new_redirect.id
+    )
+    |> repo(site).update_all(set: [destination_path: new_redirect.destination_path])
+
+    Beacon.Content.RedirectCache.invalidate(site)
   end
 
 end

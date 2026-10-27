@@ -91,7 +91,22 @@ defmodule Beacon do
 
     :pg.start_link(:beacon_cluster)
 
-    children =
+    # Dedicated Finch pool for GraphQL HTTP requests.
+    # Separate from the host app's Finch pool to prevent connection
+    # pool exhaustion when the server calls its own GraphQL endpoint.
+    finch_children = [
+      {Finch, name: Beacon.Finch, pools: %{default: [size: 10, count: 2]}}
+    ]
+
+    # Start the encryption vault if configured
+    vault_children =
+      if Application.get_env(:beacon, Beacon.Vault) do
+        [Beacon.Vault]
+      else
+        []
+      end
+
+    site_children =
       Enum.reduce(sites, [], fn opts, acc ->
         config = Beacon.Config.new(opts)
 
@@ -126,7 +141,7 @@ defmodule Beacon do
         end
       end)
 
-    Supervisor.init(children, strategy: :one_for_one)
+    Supervisor.init(finch_children ++ vault_children ++ site_children, strategy: :one_for_one)
   end
 
   defp site_child_spec(%Beacon.Config{} = config) do

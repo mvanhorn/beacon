@@ -59,12 +59,14 @@ defmodule Beacon.MixProject do
       # Overridable
       override_dep(:phoenix, "~> 1.7", "PHOENIX_VERSION", "PHOENIX_PATH"),
       override_dep(:phoenix_live_view, ">= 1.0.1", "PHOENIX_LIVE_VIEW_VERSION", "PHOENIX_LIVE_VIEW_PATH"),
-      override_dep(:mdex, "~> 0.2", "MDEX_VERSION", "MDEX_PATH"),
+      override_dep(:mdex, "~> 0.9", "MDEX_VERSION", "MDEX_PATH"),
 
       # Runtime
       {:accent, "~> 1.1"},
+      {:cloak_ecto, "~> 1.3"},
       {:ecto_sql, "~> 3.6"},
       {:ex_brotli, "~> 0.3"},
+      {:finch, "~> 0.18"},
       # FIXME: multipart copy in ex_aws_s3 2.5.0
       {:ex_aws, "~> 2.4.0"},
       {:ex_aws_s3, "~> 2.4.0"},
@@ -76,6 +78,7 @@ defmodule Beacon.MixProject do
       {:jason, "~> 1.0"},
       # TODO: remove in v0.6 or when we enable components upgrade
       {:oembed, "~> 0.4"},
+      {:req, "~> 0.5"},
       {:req_embed, "~> 0.2"},
       {:phoenix_ecto, "~> 4.4"},
       {:phoenix_html, "~> 4.0"},
@@ -84,7 +87,7 @@ defmodule Beacon.MixProject do
       {:postgrex, "~> 0.16"},
       {:safe_code, "~> 0.2"},
       {:solid, "~> 0.14"},
-      {:tailwind_compiler, github: "BeaconCMS/tailwind_compiler"},
+      {:tailwind_compiler, github: "BeaconCMS/tailwind_compiler", tag: "v0.0.7"},
       esbuild_version(),
       # Dev, Test, Docs
       {:bandit, "~> 1.0", only: :dev, optional: true},

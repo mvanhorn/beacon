@@ -33,6 +33,9 @@ defmodule Beacon.Content.LayoutSnapshot do
     field :schema_version, :integer
     field :layout_id, Ecto.UUID
     field :layout, Beacon.Types.Binary
+    field :ast, :map
+    field :default_og_image, :string
+    field :default_twitter_card, :string
     belongs_to :event, Beacon.Content.LayoutEvent
     timestamps updated_at: false
   end

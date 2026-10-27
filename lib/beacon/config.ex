@@ -228,6 +228,15 @@ defmodule Beacon.Config do
   """
   @type max_cache_entries :: non_neg_integer()
 
+  @typedoc """
+  Controls how connected LiveViews respond to page render cache invalidation.
+
+    - `:automatic` — the LiveView silently re-renders with fresh data (default)
+    - `:notify` — a notification banner appears; the user clicks to refresh
+    - `:manual` — the LiveView ignores the update entirely
+  """
+  @type live_update :: :manual | :notify | :automatic
+
   @type t :: %__MODULE__{
           site: Beacon.Types.Site.t(),
           endpoint: endpoint(),
@@ -245,11 +254,29 @@ defmodule Beacon.Config do
           extra_page_fields: extra_page_fields(),
           extra_asset_fields: extra_asset_fields(),
           default_meta_tags: default_meta_tags(),
+          site_name: binary() | nil,
+          title_template: binary() | nil,
+          default_og_image: binary() | nil,
+          default_og_image_dimensions: {pos_integer(), pos_integer()} | nil,
+          default_twitter_card: binary(),
+          twitter_site: binary() | nil,
+          fb_app_id: binary() | nil,
+          organization: map() | nil,
+          search_action_url_template: binary() | nil,
+          feeds: [map()],
+          index_now_enabled: boolean(),
+          index_now_key: binary() | nil,
+          ai_crawler_policy: :allow_search | :block_all | :allow_all | :custom,
+          ai_crawler_custom_rules: [{String.t(), :allow | :block}],
           page_warming: page_warming(),
           warming_concurrency: warming_concurrency(),
           cache_ttl: cache_ttl(),
           cache_ttls: cache_ttls(),
-          max_cache_entries: max_cache_entries()
+          max_cache_entries: max_cache_entries(),
+          circuit_breaker_ttl: non_neg_integer(),
+          live_update: live_update(),
+          live_update_overrides: %{optional(String.t()) => live_update()},
+          update_notification_component: module() | nil
         }
 
   @default_load_template [
@@ -299,11 +326,29 @@ defmodule Beacon.Config do
             extra_page_fields: [],
             extra_asset_fields: [],
             default_meta_tags: [],
+            site_name: nil,
+            title_template: nil,
+            default_og_image: nil,
+            default_og_image_dimensions: nil,
+            default_twitter_card: "summary_large_image",
+            twitter_site: nil,
+            fb_app_id: nil,
+            organization: nil,
+            search_action_url_template: nil,
+            feeds: [],
+            index_now_enabled: false,
+            index_now_key: nil,
+            ai_crawler_policy: :allow_search,
+            ai_crawler_custom_rules: [],
             page_warming: {:shortest_paths, 10},
             warming_concurrency: 4,
             cache_ttl: 60,
             cache_ttls: %{},
-            max_cache_entries: 10_000
+            max_cache_entries: 10_000,
+            circuit_breaker_ttl: 60,
+            live_update: :automatic,
+            live_update_overrides: %{},
+            update_notification_component: nil
 
   @type option ::
           {:site, Beacon.Types.Site.t()}
@@ -322,11 +367,29 @@ defmodule Beacon.Config do
           | {:extra_page_fields, extra_page_fields()}
           | {:extra_asset_fields, extra_asset_fields()}
           | {:default_meta_tags, default_meta_tags()}
+          | {:site_name, binary() | nil}
+          | {:title_template, binary() | nil}
+          | {:default_og_image, binary() | nil}
+          | {:default_og_image_dimensions, {pos_integer(), pos_integer()} | nil}
+          | {:default_twitter_card, binary()}
+          | {:twitter_site, binary() | nil}
+          | {:fb_app_id, binary() | nil}
+          | {:organization, map() | nil}
+          | {:search_action_url_template, binary() | nil}
+          | {:feeds, [map()]}
+          | {:index_now_enabled, boolean()}
+          | {:index_now_key, binary() | nil}
+          | {:ai_crawler_policy, :allow_search | :block_all | :allow_all | :custom}
+          | {:ai_crawler_custom_rules, [{String.t(), :allow | :block}]}
           | {:page_warming, page_warming()}
           | {:warming_concurrency, warming_concurrency()}
           | {:cache_ttl, cache_ttl()}
           | {:cache_ttls, cache_ttls()}
           | {:max_cache_entries, max_cache_entries()}
+          | {:circuit_breaker_ttl, non_neg_integer()}
+          | {:live_update, live_update()}
+          | {:live_update_overrides, %{optional(String.t()) => live_update()}}
+          | {:update_notification_component, module() | nil}
 
   @doc """
   Build a new `%Beacon.Config{}` instance to hold the entire configuration for each site.

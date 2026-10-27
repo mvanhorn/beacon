@@ -25,7 +25,7 @@ defmodule Beacon.Content.Page do
   alias Beacon.Content
   alias Beacon.Content.Page.Helper
 
-  @version 3
+  @version 7
 
   @type t :: %__MODULE__{}
 
@@ -37,13 +37,25 @@ defmodule Beacon.Content.Page do
     field :template, :string
     field :meta_tags, {:array, :map}, default: []
     field :raw_schema, Beacon.Types.JsonArrayMap, default: []
+    field :meta_description, :string
+    field :canonical_url, :string
+    field :robots, :string
+    field :og_title, :string
+    field :og_description, :string
+    field :og_image, :string
+    field :twitter_card, :string
+    field :date_modified, :utc_datetime_usec
+    field :collection_id, Ecto.UUID
+    field :fields, :map, default: %{}
     field :order, :integer, default: 1
     field :format, Beacon.Types.Atom, default: :heex
     field :extra, :map, default: %{}
+    field :ast, :map
 
     belongs_to :layout, Content.Layout
 
     has_many :variants, Content.PageVariant
+    has_many :page_queries, Content.PageQuery
 
     embeds_many :helpers, Helper
 
@@ -71,11 +83,23 @@ defmodule Beacon.Content.Page do
         :template,
         :meta_tags,
         :raw_schema,
+        :meta_description,
+        :canonical_url,
+        :robots,
+        :og_title,
+        :og_description,
+        :og_image,
+        :twitter_card,
+        :date_modified,
+        :collection_id,
+        :fields,
         :order,
         :layout_id,
         :format,
-        :extra
+        :extra,
+        :ast
       ])
+      |> maybe_set_date_modified()
       |> cast_embed(:helpers, with: &helpers_changeset/2)
       |> unique_constraint([:path, :site])
       |> validate_required([
@@ -109,6 +133,16 @@ defmodule Beacon.Content.Page do
       :description,
       :meta_tags,
       :raw_schema,
+      :meta_description,
+      :canonical_url,
+      :robots,
+      :og_title,
+      :og_description,
+      :og_image,
+      :twitter_card,
+      :date_modified,
+      :collection_id,
+      :fields,
       :format
     ])
     |> cast(attrs, [:path], empty_values: [])
@@ -193,6 +227,14 @@ defmodule Beacon.Content.Page do
     meta_tag
     |> Enum.reject(fn {_key, value} -> is_nil(value) || String.trim(value) == "" end)
     |> Map.new()
+  end
+
+  defp maybe_set_date_modified(changeset) do
+    if get_field(changeset, :date_modified) do
+      changeset
+    else
+      put_change(changeset, :date_modified, DateTime.utc_now() |> DateTime.truncate(:microsecond))
+    end
   end
 end
 

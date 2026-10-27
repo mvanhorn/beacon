@@ -15,15 +15,42 @@ defmodule Beacon.Boot do
     Beacon.Registry.via({site, __MODULE__})
   end
 
-  def init(%{site: site, mode: mode}) when is_atom(site) and mode in [:manual, :testing] do
+  def init(%{site: site, mode: mode} = _config) when is_atom(site) and mode in [:manual, :testing] do
     Logger.debug("Beacon.Boot is disabled for site #{site} on #{mode} mode")
     :ignore
   end
 
   def init(%{site: site, mode: :live} = _config) when is_atom(site) do
     Beacon.RuntimeRenderer.init()
+
+    seed_default_site_settings(site)
+
     :persistent_term.put({Beacon, site, :boot_ready}, true)
     Logger.info("Beacon.Boot site #{site} ready (lazy loading)")
     :ignore
+  end
+
+  defp seed_default_site_settings(site) do
+    alias Beacon.Content
+    alias Beacon.Content.SiteSetting
+
+    for {key, %{default: default, format: format, description: description}} <- SiteSetting.known_keys() do
+      case Content.get_site_setting(site, key) do
+        nil ->
+          Content.create_site_setting(%{
+            site: site,
+            key: key,
+            value: default,
+            format: format,
+            description: description
+          })
+
+        _existing ->
+          :ok
+      end
+    end
+  rescue
+    error ->
+      Logger.warning("Beacon.Boot failed to seed default site settings for #{site}: #{Exception.message(error)}")
   end
 end

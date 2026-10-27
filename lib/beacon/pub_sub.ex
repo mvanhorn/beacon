@@ -95,6 +95,40 @@ defmodule Beacon.PubSub do
 
   defp page(page), do: %{site: page.site, id: page.id, path: page.path}
 
+  # Page Render Cache
+
+  defp topic_page_render(site, path), do: "beacon:#{site}:page_render:#{path}"
+
+  def page_render_updated(site, page_id, path) do
+    topic = topic_page_render(site, path)
+    require Logger
+    Logger.info("[PubSub] Broadcasting page_render_updated on topic: #{topic}")
+    broadcast(topic, {:page_render_updated, %{site: site, page_id: page_id, path: path}}, site)
+  end
+
+  def subscribe_to_page_render(site, path) do
+    topic = topic_page_render(site, path)
+    require Logger
+    Logger.info("[PubSub] Subscribing #{inspect(self())} to #{topic}")
+    Phoenix.PubSub.subscribe(@pubsub, topic)
+  end
+
+  def unsubscribe_from_page_render(site, path) do
+    Phoenix.PubSub.unsubscribe(@pubsub, topic_page_render(site, path))
+  end
+
+  # Site Settings
+
+  def subscribe_to_site_settings(site) do
+    Phoenix.PubSub.subscribe(@pubsub, topic_content(site))
+  end
+
+  def site_setting_updated(site, key) do
+    site
+    |> topic_content()
+    |> broadcast({:content_updated, :site_setting, %{site: site, key: key}}, site)
+  end
+
   # CSS
 
   defp topic_css(site), do: "beacon:#{site}:css"
@@ -107,6 +141,24 @@ defmodule Beacon.PubSub do
     site
     |> topic_css()
     |> broadcast({:css_compiled, site}, site)
+  end
+
+  # GraphQL
+
+  defp topic_graphql(site, endpoint_name), do: "beacon:#{site}:graphql:#{endpoint_name}"
+
+  def subscribe_to_graphql(site, endpoint_name) do
+    Phoenix.PubSub.subscribe(@pubsub, topic_graphql(site, endpoint_name))
+  end
+
+  def unsubscribe_from_graphql(site, endpoint_name) do
+    Phoenix.PubSub.unsubscribe(@pubsub, topic_graphql(site, endpoint_name))
+  end
+
+  def graphql_cache_invalidated(site, endpoint_name) do
+    site
+    |> topic_graphql(endpoint_name)
+    |> broadcast({:graphql_cache_invalidated, endpoint_name}, site)
   end
 
   # Utils

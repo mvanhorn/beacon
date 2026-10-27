@@ -29,6 +29,17 @@ defmodule Beacon.Content.PageSnapshot do
     field :template, :string
     field :format, Beacon.Types.Atom, default: :heex
     field :extra, :map, default: %{}
+    field :ast, :map
+    field :meta_description, :string
+    field :canonical_url, :string
+    field :robots, :string
+    field :og_title, :string
+    field :og_description, :string
+    field :og_image, :string
+    field :twitter_card, :string
+    field :date_modified, :utc_datetime_usec
+    field :collection_id, Ecto.UUID
+    field :fields, :map, default: %{}
     belongs_to :event, Beacon.Content.PageEvent
     timestamps updated_at: false
   end

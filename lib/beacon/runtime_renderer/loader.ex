@@ -26,11 +26,31 @@ defmodule Beacon.RuntimeRenderer.Loader do
     load_error_pages(site)
     load_snippet_helpers(site)
 
-    # Pages are NOT loaded at boot. They load lazily on first request
-    # via RuntimeRenderer.lookup_page → load_page_by_path. This avoids
-    # deserializing all 1370+ page snapshot binaries (~65MB) at startup.
+    # Pages load lazily on first request — we don't deserialize page binaries
+    # at boot. But we DO load the route index (path → page_id) so dynamic
+    # route matching works from ETS without querying the DB on every request.
+    load_route_index(site)
+
+    # Load redirects into ETS for fast request-path lookups
+    Beacon.Content.RedirectCache.load_redirects(site)
 
     :ok
+  end
+
+  @doc """
+  Loads the route index (path → page_id) for all published pages into ETS.
+  This is lightweight — only path strings and UUIDs, no page binary deserialization.
+  Enables dynamic route matching (e.g., /blog/authors/:slug) from ETS at request time.
+  """
+  def load_route_index(site) do
+    paths = Content.list_published_page_paths(site)
+
+    for {page_id, path} <- paths do
+      RuntimeRenderer.register_route(site, page_id, path)
+    end
+
+    require Logger
+    Logger.info("[Beacon.RuntimeRenderer] Loaded #{length(paths)} routes for site #{site}")
   end
 
   @doc """
@@ -41,13 +61,10 @@ defmodule Beacon.RuntimeRenderer.Loader do
     # This avoids the N+1 reload+preload in list_published_pages.
     pages = Content.list_published_pages_snapshot_data(site)
 
-    # Pre-load all live_data once instead of per-page
-    all_live_data = Content.live_data_for_site(site, per_page: :infinity)
-
     results =
       Enum.map(pages, fn page ->
         try do
-          load_page(site, page, all_live_data)
+          load_page(site, page)
           :ok
         rescue
           error ->
@@ -66,17 +83,19 @@ defmodule Beacon.RuntimeRenderer.Loader do
 
   @doc """
   Loads a single published page into the RuntimeRenderer.
-  Called at boot (with pre-loaded live_data) and when a page is published (fetches live_data).
+  Called at boot and when a page is published.
   """
-  def load_page(site, %{} = page, all_live_data \\ nil) do
+  def load_page(site, %{} = page) do
     page_id = page.id
+
+    # Merge snapshot-level extra into page extra
+    # with the page-level extra (from the deserialized binary).
+    # Snapshot extra is the source of truth for fields added after publication.
+    page = merge_snapshot_extra(site, page)
 
     # Run lifecycle hooks to transform the template (e.g., markdown → HTML)
     # This is the same step the current Loader.Page does before HEEx compilation.
     template = Beacon.Lifecycle.Template.load_template(page)
-
-    # Use pre-loaded live_data when available (bulk boot), otherwise fetch
-    live_data_defs = load_live_data_defs(site, page.path, all_live_data)
 
     # Extract helpers from page (may need preloading)
     helpers =
@@ -88,6 +107,9 @@ defmodule Beacon.RuntimeRenderer.Loader do
           end)
       end
 
+    # Use pre-computed AST from snapshot/page if available
+    pre_computed_ast = Map.get(page, :ast)
+
     RuntimeRenderer.publish_page(site, page_id, %{
       template: template,
       path: page.path,
@@ -98,11 +120,39 @@ defmodule Beacon.RuntimeRenderer.Loader do
       extra: page.extra || %{},
       meta_tags: page.meta_tags || [],
       raw_schema: page.raw_schema || [],
+      meta_description: Map.get(page, :meta_description),
+      canonical_url: Map.get(page, :canonical_url),
+      robots: Map.get(page, :robots),
+      og_title: Map.get(page, :og_title),
+      og_description: Map.get(page, :og_description),
+      og_image: Map.get(page, :og_image),
+      twitter_card: Map.get(page, :twitter_card),
+      date_modified: Map.get(page, :date_modified),
+      collection_id: Map.get(page, :collection_id),
+      collection: resolve_collection(site, Map.get(page, :collection_id)),
+      fields: Map.get(page, :fields, %{}),
+      inserted_at: Map.get(page, :inserted_at),
+      updated_at: Map.get(page, :updated_at),
       assigns: %{},
-      live_data: live_data_defs,
       event_handlers: [],
-      helpers: helpers
+      helpers: helpers,
+      ast: pre_computed_ast
     })
+  end
+
+  defp resolve_collection(_site, nil), do: nil
+  defp resolve_collection(site, collection_id) do
+    case Content.get_collection(site, collection_id) do
+      nil -> nil
+      col -> %{
+        name: col.name,
+        slug: col.slug,
+        mode: col.mode,
+        fields: col.fields,
+        json_ld_mapping: col.json_ld_mapping,
+        meta_tag_mapping: col.meta_tag_mapping
+      }
+    end
   end
 
   @doc """
@@ -142,7 +192,9 @@ defmodule Beacon.RuntimeRenderer.Loader do
     for layout <- layouts do
       RuntimeRenderer.publish_layout(site, to_string(layout.id), layout.template,
         meta_tags: layout.meta_tags || [],
-        resource_links: layout.resource_links || []
+        resource_links: layout.resource_links || [],
+        default_og_image: Map.get(layout, :default_og_image),
+        default_twitter_card: Map.get(layout, :default_twitter_card)
       )
     end
 
@@ -159,8 +211,14 @@ defmodule Beacon.RuntimeRenderer.Loader do
     handlers = Content.list_event_handlers(site)
 
     for handler <- handlers do
-      # Store handlers against a site-level sentinel so any page can dispatch them
-      RuntimeRenderer.store_site_handler(site, :event, handler.name, handler.code)
+      case handler.format do
+        :actions when is_map(handler.actions) ->
+          RuntimeRenderer.store_site_handler_actions(site, :event, handler.name, handler.actions)
+
+        _ ->
+          # Default to :elixir format (backward compatible)
+          RuntimeRenderer.store_site_handler(site, :event, handler.name, handler.code)
+      end
     end
 
     require Logger
@@ -186,6 +244,10 @@ defmodule Beacon.RuntimeRenderer.Loader do
   Called from PubSub handler.
   """
   def reload_page(site, page_id) do
+    # Clear the Content-level cache so we fetch the NEWLY published
+    # snapshot, not the stale cached version.
+    Content.clear_page_cache(site, page_id)
+
     case Content.get_published_page(site, page_id) do
       nil ->
         # Page was unpublished
@@ -250,6 +312,7 @@ defmodule Beacon.RuntimeRenderer.Loader do
   """
   def reload_layout(site, layout_id) do
     layout_id = to_string(layout_id)
+    Content.clear_page_cache(site, layout_id)
 
     case Content.get_published_layout(site, layout_id) do
       nil ->
@@ -260,7 +323,9 @@ defmodule Beacon.RuntimeRenderer.Loader do
       layout ->
         RuntimeRenderer.publish_layout(site, to_string(layout.id), layout.template,
           meta_tags: layout.meta_tags || [],
-          resource_links: layout.resource_links || []
+          resource_links: layout.resource_links || [],
+          default_og_image: Map.get(layout, :default_og_image),
+          default_twitter_card: Map.get(layout, :default_twitter_card)
         )
     end
   end
@@ -307,42 +372,33 @@ defmodule Beacon.RuntimeRenderer.Loader do
     load_info_handlers(site)
   end
 
-  # Load live_data definitions for a specific path.
-  # When all_live_data is pre-loaded (bulk boot), uses it directly.
-  # When nil, fetches from DB (single-page reload).
-  defp load_live_data_defs(site, page_path, all_live_data) do
-    all_live_data = all_live_data || Content.live_data_for_site(site, per_page: :infinity)
+  # Merge the snapshot-level extra column into the page struct's extra.
+  # Snapshot extra may contain fields added after publication.
+  defp merge_snapshot_extra(site, page) do
+    import Ecto.Query
 
-    matching =
-      Enum.filter(all_live_data, fn ld ->
-        path_matches?(ld.path, page_path)
-      end)
+    snapshot_extra =
+      try do
+        Beacon.Utils.repo(site).one(
+          from(s in "beacon_page_snapshots",
+            where: s.path == ^page.path and s.site == ^to_string(site),
+            order_by: [desc: s.inserted_at],
+            limit: 1,
+            select: s.extra
+          )
+        )
+      rescue
+        _ -> nil
+      end
 
-    Enum.flat_map(matching, fn ld ->
-      Enum.map(ld.assigns, fn assign ->
-        %{
-          key: String.to_atom(assign.key),
-          value: assign.value,
-          format: assign.format,
-          path_pattern: ld.path
-        }
-      end)
-    end)
-  end
+    case snapshot_extra do
+      extra when is_map(extra) and extra != %{} ->
+        updated_extra = Map.merge(page.extra || %{}, extra)
+        %{page | extra: updated_extra}
 
-  defp path_matches?(live_data_path, page_path) do
-    ld_segments = String.split(String.trim_leading(live_data_path, "/"), "/", trim: true)
-    page_segments = String.split(String.trim_leading(page_path, "/"), "/", trim: true)
-
-    if length(ld_segments) != length(page_segments) do
-      false
-    else
-      Enum.zip(ld_segments, page_segments)
-      |> Enum.all?(fn
-        {":" <> _, _} -> true
-        {"*" <> _, _} -> true
-        {a, b} -> a == b
-      end)
+      _ ->
+        page
     end
   end
+
 end
